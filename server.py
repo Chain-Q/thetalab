@@ -224,7 +224,7 @@ class Workbench:
         def run():
             try:
                 proc = subprocess.Popen(
-                    [sys.executable, "-m", "thetalab.scripts.collect_daily"],
+                    [sys.executable, str(ROOT / "thetalab" / "scripts" / "collect_daily.py")],
                     cwd=str(ROOT), stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                     text=True, encoding="utf-8", errors="ignore")
                 for line in proc.stdout:
@@ -293,7 +293,7 @@ class Workbench:
         self.update_status = {"running": True, "tail": [], "done": False}
         try:
             proc = subprocess.Popen(
-                [sys.executable, "-m", "thetalab.scripts.collect_daily", str(day)],
+                [sys.executable, str(ROOT / "thetalab" / "scripts" / "collect_daily.py"), str(day)],
                 cwd=str(ROOT), stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                 text=True, encoding="utf-8", errors="ignore")
             for line in proc.stdout:
@@ -442,7 +442,7 @@ class Workbench:
         def run():
             try:
                 proc = subprocess.Popen(
-                    [sys.executable, "-m", "thetalab.scripts.collect_contract_history", code],
+                    [sys.executable, str(ROOT / "thetalab" / "scripts" / "collect_contract_history.py"), code],
                     cwd=str(ROOT), stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                     text=True, encoding="utf-8", errors="ignore")
                 for line in proc.stdout:
