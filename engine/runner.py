@@ -245,14 +245,15 @@ class BacktestRunner:
     def _build_chain(self, day: date, day_risk: pd.DataFrame) -> Dict[str, MarketRow]:
         rows: Dict[str, MarketRow] = {}
         i = self._days.index(day)
-        spot_prev = float(self.underlying_close.get(self._days[i - 1], spot_nan(day))) \
-            if i > 0 else float("nan")
-        spot_now = float(self.underlying_close[day])
+        prev_day = self._days[i - 1] if i > 0 else None
         for r in day_risk.itertuples(index=False):
             d = self._daily_ix.get((r.contract_id, day))                 or self._daily_ix_sid.get((r.security_id, day))
             if d is None or not d.close > 0:
                 continue
             inst = self.spec.option(r.underlying, Right[r.right], r.expiry, float(r.strike))
+            # 标的收盘按各合约自己的品种取（多品种：510300 的虚值度不能用 588000 的价格算）
+            spot_now = self._spot(r.underlying, day)
+            spot_prev = self._spot(r.underlying, prev_day) if prev_day else float("nan")
             rows[inst.symbol] = MarketRow(
                 instrument=inst, trade_date=day, close=float(d.close),
                 volume=float(getattr(d, "volume_lots", 0.0) or 0.0),

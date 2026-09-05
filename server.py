@@ -93,8 +93,8 @@ class Workbench:
         for u_, g_ in udl.groupby("underlying"):
             for d_, c_ in zip(g_["date"], g_["close"].astype(float)):
                 self.close_all[(u_, d_)] = c_
-        close = pd.Series(udl[udl["underlying"] == UNDERLYINGS[0]]["close"].astype(float).values,
-                          index=udl[udl["underlying"] == UNDERLYINGS[0]]["date"].values)
+        close = pd.Series(udl[udl["underlying"] == DEFAULT_UND]["close"].astype(float).values,
+                          index=udl[udl["underlying"] == DEFAULT_UND]["date"].values)
         self.feed = BacktestRunner(risk_all, daily, close)   # 全品种 risk；撮合数据仅 510300
         self.daily_unds = set(daily["contract_id"].astype(str).str[:6].unique())
         self.days = self.feed._days
@@ -432,8 +432,8 @@ class Workbench:
     def start_collect(self, code: str) -> dict:
         if code not in UNDERLYINGS:
             return {"ok": False, "msg": f"未知品种 {code}"}
-        if code == UNDERLYINGS[0]:
-            return {"ok": True, "msg": "510300 已有完整行情，无需采集"}
+        if code == DEFAULT_UND:
+            return {"ok": True, "msg": f"{DEFAULT_UND} 已有完整行情，无需采集"}
         if self.collect_status["running"]:
             return {"ok": False, "msg": f"采集进行中（{self.collect_status['code']}），请稍候"}
         self.collect_status = {"running": True, "code": code,
@@ -473,7 +473,7 @@ class Workbench:
         risk_all = store.read("risk_indicators")
         daily = pd_read(self.data_dir / "store" / "contract_daily" / "all.parquet")
         udl = pd_read(self.data_dir / "store" / "underlying_daily" / "all.parquet")
-        udl = udl[udl["underlying"] == UNDERLYINGS[0]]
+        udl = udl[udl["underlying"] == DEFAULT_UND]
         close = pd.Series(udl["close"].astype(float).values, index=udl["date"].values)
         self.feed = BacktestRunner(risk_all, daily, close)
         self.days = self.feed._days
@@ -584,7 +584,7 @@ class Workbench:
     def state(self, underlying=None):
         und = underlying or self.underlying
         if und not in UNDERLYINGS:
-            und = UNDERLYINGS[0]
+            und = DEFAULT_UND
         day = self.cursor
         account = self.store.load_account()
         note = UND_NOTE.get(und)
