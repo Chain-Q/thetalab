@@ -166,33 +166,25 @@ class Workbench:
     def _sse_snapshot_fallback(self, day, chain: dict) -> dict:
         """沪市当日快照兜底：逐合约日线未发布的交易日（新浪滞后 1~2 日），
         用 OI 快照库里的当日实时价补齐行情——持仓盯市不再卡在 2 天前。
-        仅注入日线缺失的合约；价差模型照常按快照价+当日虚值度工作。"""
+        仅注入日线缺失的合约（官方口径优先）；价差模型照常按快照价+当日虚值度工作。"""
         snap = self._oi.get(day)
         if snap is None:
             return {}
         rows = {}
-        import dataclasses
+        risk_day = self.feed.risk_by_day.get(day)
         for r in snap.reset_index().itertuples(index=False):
-            inst = None
+            # security_id → 合约（risk 表当日映射；OI 快照无 contract_id 列）
             try:
-                inst = next((row.instrument for row in chain.values()
-                             if row.instrument.symbol == getattr(r, "contract_id", None)), None)
-            except Exception:
-                inst = None
-            if inst is not None:
-                continue   # 日线已有,官方口径优先
-            if inst is None:
-                # 用 security_id→contract 映射从 spec 构造
-                try:
-                    row_r = self.feed.risk_by_day[day]
-                    g = row_r[row_r["security_id"] == getattr(r, "security_id", None)]
-                    if g.empty:
-                        continue
-                    g = g.iloc[0]
-                    inst = self.feed.spec.option(g["underlying"], Right[g["right"]],
-                                                 g["expiry"], float(g["strike"]))
-                except Exception:
+                g = risk_day[risk_day["security_id"] == getattr(r, "security_id", None)]
+                if g.empty:
                     continue
+                g = g.iloc[0]
+                inst = self.feed.spec.option(g["underlying"], Right[g["right"]],
+                                             g["expiry"], float(g["strike"]))
+            except Exception:
+                continue
+            if inst.symbol in chain:
+                continue   # 日线已有 → 官方口径优先，不被快照覆盖
             last = float(getattr(r, "last", float("nan")))
             vol = float(getattr(r, "volume", 0.0) or 0.0)
             if last != last or last <= 0:
