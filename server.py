@@ -157,10 +157,56 @@ class Workbench:
 
     # ------------------------------------------------------------ 挂单/确认/推进
     def _full_chain(self, day):
-        """沪市日线链 + 深市快照链合并（多品种撮合的统一行情面）"""
+        """沪市日线链 + 沪市当日快照兜底(日线未发布的合约) + 深市快照链合并（多品种撮合的统一行情面）"""
         chain = self.feed._build_chain(day, self.feed.risk_by_day[day])
+        chain.update(self._sse_snapshot_fallback(day, chain))
         chain.update(self._szse_market_rows(day, "159915"))
         return chain
+
+    def _sse_snapshot_fallback(self, day, chain: dict) -> dict:
+        """沪市当日快照兜底：逐合约日线未发布的交易日（新浪滞后 1~2 日），
+        用 OI 快照库里的当日实时价补齐行情——持仓盯市不再卡在 2 天前。
+        仅注入日线缺失的合约；价差模型照常按快照价+当日虚值度工作。"""
+        snap = self._oi.get(day)
+        if snap is None:
+            return {}
+        rows = {}
+        import dataclasses
+        for r in snap.reset_index().itertuples(index=False):
+            inst = None
+            try:
+                inst = next((row.instrument for row in chain.values()
+                             if row.instrument.symbol == getattr(r, "contract_id", None)), None)
+            except Exception:
+                inst = None
+            if inst is not None:
+                continue   # 日线已有,官方口径优先
+            if inst is None:
+                # 用 security_id→contract 映射从 spec 构造
+                try:
+                    row_r = self.feed.risk_by_day[day]
+                    g = row_r[row_r["security_id"] == getattr(r, "security_id", None)]
+                    if g.empty:
+                        continue
+                    g = g.iloc[0]
+                    inst = self.feed.spec.option(g["underlying"], Right[g["right"]],
+                                                 g["expiry"], float(g["strike"]))
+                except Exception:
+                    continue
+            last = float(getattr(r, "last", float("nan")))
+            vol = float(getattr(r, "volume", 0.0) or 0.0)
+            if last != last or last <= 0:
+                continue
+            spot_now = self.close_all.get((inst.underlying, day), float("nan"))
+            rows[inst.symbol] = MarketRow(
+                instrument=inst, trade_date=day, close=last, volume=vol,
+                pre_close=float(getattr(r, "pre_close", last) or last),
+                pre_settle=float(getattr(r, "pre_close", last) or last),
+                spot_close=spot_now,
+                spot_prev_close=self.close_all.get(
+                    (inst.underlying, self.days[max(self.days.index(day) - 1, 0)])
+                    if day in self.days else float("nan")))
+        return rows
 
     def place_order(self, symbol, direction, offset, qty):
         if direction not in ("BUY", "SELL") or offset not in ("OPEN", "CLOSE"):
@@ -224,14 +270,20 @@ class Workbench:
         return True
 
     def _reprice_positions(self):
-        """数据更新/补采后按缺失交易日逐日重估持仓盯市。
+        """数据更新/补采后按缺口交易日逐日重估持仓盯市（含最新日，快照兜底链生效）。
         修复"更新数据后持仓盈亏不变"：此前盯市只在「推进」时发生，
-        补采历史缺口日不会重估——现在按 paper_last_marked 之后的交易日逐日 daily_update。"""
+        补采历史缺口日不会重估——现在按 paper_last_marked 之后的交易日逐日 daily_update；
+        若水位已是最新但当日行情面刚补齐（此前重估时链为空），水位回退一日强制重刷。"""
         try:
+            # 若水位日已在 equity_curve 中,但该日链行情是后来补的 → 回退重刷当日
+            if (self.paper_last_marked and self.cursor == self.paper_last_marked
+                    and self.paper_last_marked in self.days):
+                self.paper_last_marked = self.days[max(self.days.index(self.paper_last_marked) - 1, 0)]
             done = [d for d in self.days
                     if self.paper_last_marked and d > self.paper_last_marked]
             for d in done:
-                self.paper.daily_update(d, match_orders=False)   # 重估只盯市,不替用户成交
+                self.paper.daily_update(d, match_orders=False,      # 重估只盯市,不替用户成交
+                                        chain_fn=self._full_chain)
                 self.paper_last_marked = d
             self.update_status["tail"].append(
                 f"持仓重估: {len(done)} 日" if done else "持仓重估: 已是最新")
@@ -434,11 +486,14 @@ class Workbench:
             # 用当天收盘价把 PENDING/CONFIRMED 挂单撮合掉，不阻塞收盘后的模拟下单。
             if self.store.pending("CONFIRMED") or self.store.pending("PENDING"):
                 day = self.cursor
-                report = self.paper.daily_update(day, include_pending=True)
+                report = self.paper.daily_update(day, include_pending=True,
+                                                 chain_fn=self._full_chain)
                 return {"ok": True, "day": str(day), "equity": report.equity,
                         "fills": report.fills, "notes": report.notes,
                         "signals": len(report.signals), "same_day": True}
-            return {"ok": False, "msg": "已到数据尽头（当前为最新交易日）。可在此日挂单后再次点击「推进」按当日收盘价撮合"}
+            # 无挂单：做一次持仓重估（数据更新/补采后点推进也能立即看到盈亏变化）
+            self._reprice_positions()
+            return {"ok": False, "msg": "已到数据尽头（当前为最新交易日）。可在此日挂单后再次点击「推进」按当日收盘价撮合；持仓已按最新收盘重估"}
         self.cursor = self.days[i + 1]
         report = self.paper.daily_update(self.cursor)
         return {"ok": True, "day": str(self.cursor), "equity": report.equity,

@@ -72,7 +72,7 @@ class PaperTradingRunner:
 
     # ------------------------------------------------------------ 主入口
     def daily_update(self, day: date, include_pending: bool = False,
-                     match_orders: bool = True) -> DailyReport:
+                     match_orders: bool = True, chain_fn=None) -> DailyReport:
         report = DailyReport(day=day, equity=0.0, margin_ratio=0.0)
         # 1) 恢复状态
         self.account = self.store.load_account() or Account(initial_cash=1_000_000.0,
@@ -88,7 +88,7 @@ class PaperTradingRunner:
             return report
 
         # 2) 数据装配（+深市快照行注入，多品种撮合）+ 八道闸门
-        chain = self.feed._build_chain(day, day_risk)
+        chain = chain_fn(day) if chain_fn else self.feed._build_chain(day, day_risk)
         if self.extra_rows_fn:
             for sym, mrow in (self.extra_rows_fn(day) or {}).items():
                 if sym not in chain:
