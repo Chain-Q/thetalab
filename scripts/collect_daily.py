@@ -126,26 +126,28 @@ def main(day: date = None):
     # 2c) 沪市逐合约日线日级补缺：新浪日线发布滞后（实测 8-31 采于 20:57 全部只有 8-28），
     # 而 collect_contract_history 按 security_id 断点、采过即跳过，缺口会永久留存 →
     # 撮合链缺当日沪市合约，下单报"当日无该合约行情"。
-    # 覆盖检查按"交易日 × 合约数"对照 risk 表（仅有该日 1 个合约也算缺）。
+    # 交易日基准 = risk ∪ underlying_daily（服务器停机的夜晚 risk 也可能整日缺失，
+    # 但 sina 标的日线发布及时，可当交易日历）；缺日先补 risk 再补逐合约日线。
     try:
         daily_all = pd.read_parquet(store.root / "contract_daily" / "all.parquet")
         daily_all["_d"] = daily_all["trade_date"].astype(str).str[:10]
-        cnt_by_day = daily_all[daily_all["_d"] < str(day)].groupby("_d").size().to_dict()
+        cnt_by_day = daily_all[daily_all["_d"] <= str(day)].groupby("_d").size().to_dict()
         risk_df = store.read("risk_indicators")
         risk_days = set(risk_df["trade_date"].astype(str).str[:10].unique())
-        # 近 3 个已发布交易日(risk 有、非今天)里,日线合约数 < risk 合约数 × 80% 视为缺
+        udl_days = set(pd.read_parquet(store.root / "underlying_daily" / "all.parquet")
+                       ["date"].astype(str).str[:10].unique())
         risk_cnt = risk_df[risk_df["underlying"] != "159915"].groupby(
             risk_df["trade_date"].astype(str).str[:10]).size().to_dict()
+        expect_default = max(risk_cnt.values()) if risk_cnt else 600
         missing_days = []
-        for d in sorted(risk_days)[-4:]:
-            if d >= str(day):
+        for d in sorted(risk_days | udl_days)[-5:]:
+            if d > str(day):
                 continue
-            if cnt_by_day.get(d, 0) < 0.8 * risk_cnt.get(d, 0):
+            if cnt_by_day.get(d, 0) < 0.8 * risk_cnt.get(d, expect_default):
                 missing_days.append(d)
-        missing_days = missing_days[:1]   # 单次补 1 天(全合约逐个拉,一天约 600 请求)
+        missing_days = missing_days[:2]   # 单次最多补 2 天（每天约 600 合约请求）
         if missing_days:
-            tgt = missing_days[0]   # 本次只补 1 天
-            log.append(f"沪市逐合约日线缺日: {tgt}，增量补拉（仅缺失合约）")
+            log.append(f"沪市逐合约日线缺日: {missing_days}，增量补拉（仅缺失合约）")
             # 用显式 spec 加载绕过"thetalab 默认查找失效"的环境问题（与头部兜底同理）
             import importlib.util as _iu
             def _load_cch():
@@ -161,44 +163,61 @@ def main(day: date = None):
                 from thetalab.scripts.collect_contract_history import build_contract_id_map
             except Exception:   # 默认查找失败 → 显式加载
                 build_contract_id_map = _load_cch()
-            m_day, m_glob = build_contract_id_map(risk_df)
-            # 仅缺失合约：risk 该日有、contract_daily 该日缺的 security_id
-            risk_tgt = risk_df[risk_df["trade_date"].astype(str).str[:10] == tgt]
-            have_tgt = set(daily_all[daily_all["_d"] == tgt]["security_id"].unique())
-            todo = [(s, u) for s, u in
-                    risk_tgt[risk_tgt["underlying"] != "159915"]
-                    .drop_duplicates("security_id")[["security_id", "underlying"]]
-                    .itertuples(index=False, name=None)
-                    if s not in have_tgt]
-            log.append(f"  目标日 {tgt} 合约 {risk_tgt['security_id'].nunique()} 个，缺失待补 {len(todo)}")
-            ok2 = fail2 = 0
-            new_rows = []
-            for sid, und in todo:
-                try:
-                    df = p.contract_daily(sid)
-                    if df.empty:
-                        continue
-                    df["security_id"] = sid
-                    df["underlying"] = und
-                    df["trade_date"] = df["date"]
-                    key = list(zip(df["trade_date"], df["security_id"]))
-                    cid = pd.Series([m_day.get(k) for k in key]) \
-                        .fillna(df["security_id"].map(m_glob))
-                    df["contract_id"] = cid.fillna(df["security_id"])
-                    new_rows.append(df)
-                    ok2 += 1
-                except Exception:
-                    fail2 += 1
-            if new_rows:
-                inc = pd.concat(new_rows, ignore_index=True)
-                all2 = pd.concat([daily_all, inc], ignore_index=True) \
-                    .drop_duplicates(subset=["trade_date", "contract_id"], keep="last")
-                all2.to_parquet(store.root / "contract_daily" / "all.parquet", index=False)
-                log.append(f"逐合约日线补缺: +{len(inc)} 行（{ok2} 合约 / fail {fail2}）→ 落库 {len(all2)}")
-            else:
-                log.append(f"逐合约日线补缺: 数据源仍无 {tgt}（发布滞后），下轮重试")
+            for tgt in missing_days:
+                # risk 也缺该日 → 先补 risk（交易所历史文件可回拉），否则用其合约清单
+                if tgt not in risk_days:
+                    try:
+                        rd = p.risk_indicators(date.fromisoformat(tgt))
+                        if not rd.empty:
+                            store.write("risk_indicators", rd)
+                            risk_df = pd.concat([risk_df, rd], ignore_index=True)
+                            log.append(f"  补 {tgt} 风险指标: +{len(rd)} 行")
+                    except Exception as e:
+                        log.append(f"  补 {tgt} 风险指标 FAIL: {type(e).__name__}")
+                risk_tgt = risk_df[risk_df["trade_date"].astype(str).str[:10] == tgt]
+                if risk_tgt.empty:   # risk 拉不到：用最近一天的合约清单兜底
+                    last_d = max(risk_days)
+                    risk_tgt = risk_df[risk_df["trade_date"].astype(str).str[:10] == last_d]
+                m_day, m_glob = build_contract_id_map(risk_df)
+                have_tgt = set(daily_all[daily_all["_d"] == tgt]["security_id"].unique())
+                todo = [(s, u) for s, u in
+                        risk_tgt[risk_tgt["underlying"] != "159915"]
+                        .drop_duplicates("security_id")[["security_id", "underlying"]]
+                        .itertuples(index=False, name=None)
+                        if s not in have_tgt]
+                log.append(f"  目标日 {tgt} 合约 {risk_tgt['security_id'].nunique()} 个，缺失待补 {len(todo)}")
+                ok2 = fail2 = 0
+                new_rows = []
+                for sid, und in todo:
+                    try:
+                        df = p.contract_daily(sid)
+                        if df.empty:
+                            continue
+                        df = df[df["date"].astype(str).str[:10] == tgt]   # 只取缺口日行
+                        if df.empty:
+                            continue
+                        df["security_id"] = sid
+                        df["underlying"] = und
+                        df["trade_date"] = df["date"]
+                        key = list(zip(df["trade_date"], df["security_id"]))
+                        cid = pd.Series([m_day.get(k) for k in key]) \
+                            .fillna(df["security_id"].map(m_glob))
+                        df["contract_id"] = cid.fillna(df["security_id"])
+                        new_rows.append(df)
+                        ok2 += 1
+                    except Exception:
+                        fail2 += 1
+                if new_rows:
+                    inc = pd.concat(new_rows, ignore_index=True)
+                    daily_all = pd.concat([daily_all, inc], ignore_index=True) \
+                        .drop_duplicates(subset=["trade_date", "contract_id"], keep="last")
+                    daily_all.to_parquet(store.root / "contract_daily" / "all.parquet",
+                                         index=False)
+                    log.append(f"  逐合约日线补缺 {tgt}: +{len(inc)} 行（{ok2} 合约 / fail {fail2}）")
+                else:
+                    log.append(f"  逐合约日线补缺 {tgt}: 数据源仍无（发布滞后），下轮重试")
         else:
-            log.append("逐合约日线日级覆盖完整（近 3 交易日）")
+            log.append("逐合约日线日级覆盖完整（近 5 交易日）")
     except Exception as e:
         log.append(f"逐合约日线补缺 FAIL: {type(e).__name__} {str(e)[:60]}")
 

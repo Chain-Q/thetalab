@@ -111,6 +111,14 @@ class Workbench:
         self.paper = PaperTradingRunner(self.feed, self.store, data_dir=self.data_dir,
                                         extra_rows_fn=self._szse_market_rows)
         self.cursor = self.days[-1]   # 默认最近交易日
+        # 持仓盯市水位：账户净值曲线的最后一天（重启后也正确，避免重估已结算日）
+        try:
+            _eq = self.store.equity_curve()
+            # (day, equity) 最后一天;day 存的是 str → 统一转 date 供后续比较
+            self.paper_last_marked = (date.fromisoformat(_eq[-1][0][:10])
+                                      if _eq else None)
+        except Exception:
+            self.paper_last_marked = None
         self.update_status = {"running": False, "tail": [], "done": False}
         from datetime import datetime as _dt
         self.server_started = _dt.now().strftime("%Y-%m-%d %H:%M")
@@ -214,6 +222,21 @@ class Workbench:
         self.cursor = new_cursor
         self.update_status["tail"].append(f"CURSOR→{new_cursor}")
         return True
+
+    def _reprice_positions(self):
+        """数据更新/补采后按缺失交易日逐日重估持仓盯市。
+        修复"更新数据后持仓盈亏不变"：此前盯市只在「推进」时发生，
+        补采历史缺口日不会重估——现在按 paper_last_marked 之后的交易日逐日 daily_update。"""
+        try:
+            done = [d for d in self.days
+                    if self.paper_last_marked and d > self.paper_last_marked]
+            for d in done:
+                self.paper.daily_update(d, match_orders=False)   # 重估只盯市,不替用户成交
+                self.paper_last_marked = d
+            self.update_status["tail"].append(
+                f"持仓重估: {len(done)} 日" if done else "持仓重估: 已是最新")
+        except Exception as e:
+            self.update_status["tail"].append(f"持仓重估 FAIL: {type(e).__name__} {str(e)[:50]}")
 
     def start_update(self) -> dict:
         """页面一键更新当日数据：collect_daily（风险指标/标的日线/持仓快照/深市快照）→ reload"""
@@ -480,6 +503,8 @@ class Workbench:
         self.paper.feed = self.feed
         if self.cursor not in self.days:
             self.cursor = self.days[-1]
+        # 数据有新交易日 → 按缺口日逐日重估持仓盯市（盈亏随最新收盘变化）
+        self._reprice_positions()
 
     # ------------------------------------------------------------ 行情装配
     def _quote(self, day, contract_id, security_id, underlying):

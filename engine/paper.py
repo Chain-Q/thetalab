@@ -71,7 +71,8 @@ class PaperTradingRunner:
         self.pf: Optional[Portfolio] = None
 
     # ------------------------------------------------------------ 主入口
-    def daily_update(self, day: date, include_pending: bool = False) -> DailyReport:
+    def daily_update(self, day: date, include_pending: bool = False,
+                     match_orders: bool = True) -> DailyReport:
         report = DailyReport(day=day, equity=0.0, margin_ratio=0.0)
         # 1) 恢复状态
         self.account = self.store.load_account() or Account(initial_cash=1_000_000.0,
@@ -104,7 +105,8 @@ class PaperTradingRunner:
                               "pnl": t.realized_pnl} for t in fills]
 
         # 4) 人工确认单（昨日 PENDING → 今日按 CLOSE_SLIPPAGE 撮合）
-        report.fills += self._match_confirmed(day, chain, include_pending=include_pending)
+        if match_orders:   # 盯市重估(match_orders=False)不替用户成交
+            report.fills += self._match_confirmed(day, chain, include_pending=include_pending)
 
         # 5) 盯市 + 维持保证金（多品种：各合约用其标的当日收盘）+ Greeks 快照
         self.pf.update_mark({s: r.close for s, r in chain.items() if r.close > 0})
