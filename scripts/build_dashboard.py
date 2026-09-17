@@ -89,17 +89,28 @@ def assemble():
     if recs and recs[0].spec:
         orders, _ = resolve_legs(recs[0].spec, chain_df, day, spot, 1_000_000.0,
                                  margin_of=lambda row, s, e, t: 3000.0)
+        # 标的腿（kind=UNDERLYING）resolve 出的 Instrument 既无 expiry 也无数量
+        # （qty=0，尺寸留给上层补），对期权盈亏曲线零贡献 → 直接跳过，
+        # 否则 expiry=None 参与日期减法会 TypeError 让整张静态页生成失败
+        orders = [x for x in orders if x.qty and x.instrument.expiry]
         if orders:
+            # 取价键用合约对象而非 contract_id 字符串：分红调整(A)合约的交易所代码与
+            # spec.option() 生成的 symbol 不同，用 contract_id 查会查空 → iloc[0] 直接
+            # IndexError，整张静态页生成失败（2026-09-12 持仓/推荐含该档合约时复现）
+            have = chain_df["_instrument"].notna()
+            px = {i.symbol: c for i, c in
+                  zip(chain_df.loc[have, "_instrument"], chain_df.loc[have, "close"])}
             legs = []
             for o in orders:
+                e = px.get(o.instrument.symbol)
+                if e is None or e != e or e <= 0:
+                    legs = []      # 该推荐腿当日无行情：宁可不画也不用错价
+                    break
                 legs.append(PayoffLeg(right=o.instrument.right, strike=o.instrument.strike,
                                       expiry=o.instrument.expiry,
                                       qty=o.qty * (1 if o.direction.value == "BUY" else -1),
                                       multiplier=o.instrument.multiplier,
-                                      entry_price=float(chain_df.loc[
-                                          chain_df["contract_id"] == o.instrument.symbol,
-                                          "close"].iloc[0]),
-                                      iv=0.16))
+                                      entry_price=float(e), iv=0.16))
             c = build_curves(legs, spot=spot, asof=day)
             payoff = {"spots": [round(x, 4) for x in c.spots],
                       "at_expiry": [round(x) for x in c.at_expiry],
@@ -159,6 +170,7 @@ def assemble():
     if recs and recs[0].spec:
         orders, _ = resolve_legs(recs[0].spec, chain_df, day, spot, 1_000_000.0,
                                  margin_of=lambda row, s_, e_, t_: 3000.0)
+        orders = [x for x in orders if x.qty and x.instrument.expiry]
         if orders:
             legs = []
             for o in orders:

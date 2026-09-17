@@ -84,29 +84,13 @@ class Workbench:
     """装配器 + 模拟时钟 + 多品种切换。路由逻辑在此（可单测），HTTP 壳在 Handler。"""
 
     def __init__(self, data_dir=None, auto_update=True):
-        self.data_dir = data_dir or ROOT / "thetalab_data"
-        store = ParquetStore(self.data_dir / "store")
-        risk_all = store.read("risk_indicators")
-        daily = pd_read(self.data_dir / "store" / "contract_daily" / "all.parquet")
-        udl = pd_read(self.data_dir / "store" / "underlying_daily" / "all.parquet")
-        self.close_all = {}   # (underlying, date) -> 收盘价（全部品种）
-        for u_, g_ in udl.groupby("underlying"):
-            for d_, c_ in zip(g_["date"], g_["close"].astype(float)):
-                self.close_all[(u_, d_)] = c_
-        close = pd.Series(udl[udl["underlying"] == DEFAULT_UND]["close"].astype(float).values,
-                          index=udl[udl["underlying"] == DEFAULT_UND]["date"].values)
-        self.feed = BacktestRunner(risk_all, daily, close)   # 全品种 risk；撮合数据仅 510300
-        self.daily_unds = set(daily["contract_id"].astype(str).str[:6].unique())
-        self.days = self.feed._days
+        # data_dir 接受 str|Path（脚本/测试常传字符串路径，此前传 str 直接 TypeError）
+        self.data_dir = Path(data_dir) if data_dir else ROOT / "thetalab_data"
+        self._idx_cache = {}    # 当日 risk 表派生索引（reload 时清空）
+        self._szse_cache = {}   # 深市快照 parquet 缓存（按文件 mtime 失效）
+        self._load_market()
         self.underlying = DEFAULT_UND   # 默认模拟时钟品种
         self.broker = Broker()
-        self._oi = {}
-        for f in (self.data_dir / "store" / "oi_snapshots").glob("*.parquet"):
-            df = pd_read(f)
-            for d, g in df.groupby("trade_date"):
-                self._oi[d] = g.set_index("security_id")
-        # 多品种标的价贯穿（撮合/盯市/结算/Greeks 全部经此取价）
-        self.feed.spot_fn = lambda u, d: self.close_all.get((u, d), float("nan"))
         self.store = StateStore(self.data_dir / "paper.db")
         self.paper = PaperTradingRunner(self.feed, self.store, data_dir=self.data_dir,
                                         extra_rows_fn=self._szse_market_rows)
@@ -126,6 +110,9 @@ class Workbench:
         self.live_cache = {}
         self.live_thread = None
         self.live_target = None            # (underlying, expiry) 或 None
+        # 轮询线程的产出侧指标（教训："线程存活"≠"线程工作"，必须能看到条数/耗时）
+        self.live_stats = {"rounds": 0, "sids": 0, "quotes": 0,
+                           "seconds": 0.0, "last_ok": None}
         self._last_auto_date = None        # 调度器去重
         self._last_probe = None            # 晚间探测节流
         self._probe_provider = None        # 惰性创建（避免拖慢启动与测试）
@@ -133,6 +120,49 @@ class Workbench:
             threading.Thread(target=self._auto_update_loop, daemon=True).start()
         self.collect_status = {"running": False, "code": None, "started": None,
                                "tail": [], "done": False}
+        # 后台线程的致命错误计数（教训：live 线程 NameError 被裸 try 吞掉，
+        # 实时行情"从未工作过"却对外一直返回 ok）
+        self.thread_errors = {"auto_update": 0, "live": 0, "last": None}
+
+    # ------------------------------------------------------------ 行情面装配
+    def _load_market(self):
+        """读盘装配行情面：风险指标 / 逐合约日线 / 标的收盘 / OI 快照 → BacktestRunner。
+
+        __init__ 与 reload_data **必须共用这一条路径**。热更新此前只重建 feed，
+        漏掉 spot_fn / close_all / _oi / daily_unds 四项：
+          - spot_fn 丢失 → _spot() 退回 underlying_close（=DEFAULT_UND 收盘），
+            所有品种的标的价都变成 510300 的价 → 虚值度失真 → 价差模型把
+            510050 卖开成交价从 -1.7% 打到 -8.0%（实测 482/743 行 spot 错）；
+          - close_all 不刷新 → 新交易日的标的收盘缺失，页面 spot=None、Greeks 无解；
+          - _oi 不刷新 → 当日快照兜底与 _quote 兜底在重启前全部失效；
+          - daily_unds 不刷新 → 新采品种的 has_daily_bars 一直 False（页面禁止下单）。
+        """
+        store = ParquetStore(self.data_dir / "store")
+        risk_all = store.read("risk_indicators")
+        daily = pd_read(self.data_dir / "store" / "contract_daily" / "all.parquet")
+        udl = pd_read(self.data_dir / "store" / "underlying_daily" / "all.parquet")
+        close_all = {}   # (underlying, date) -> 收盘价（全部品种）
+        for u_, g_ in udl.groupby("underlying"):
+            for d_, c_ in zip(g_["date"], g_["close"].astype(float)):
+                close_all[(u_, d_)] = c_
+        dflt = udl[udl["underlying"] == DEFAULT_UND]
+        close = pd.Series(dflt["close"].astype(float).values, index=dflt["date"].values)
+        feed = BacktestRunner(risk_all, daily, close)   # 全品种 risk
+        # 多品种标的价贯穿（撮合/盯市/结算/Greeks 全部经此取价）——热更新后必须重挂
+        feed.spot_fn = lambda u, d: close_all.get((u, d), float("nan"))
+        oi = {}
+        for f in (self.data_dir / "store" / "oi_snapshots").glob("*.parquet"):
+            df = pd_read(f)
+            for d, g in df.groupby("trade_date"):
+                oi[d] = g.set_index("security_id")
+        self.close_all = close_all
+        self.feed = feed
+        self.days = feed._days
+        self._oi = oi
+        # contract_daily 有少量 contract_id 缺失行（实测 9/197129）：dropna 防 NaN 混进品种集合
+        self.daily_unds = {str(c)[:6] for c in daily["contract_id"].dropna().unique()}
+        self._idx_cache = {}
+        self._szse_cache = {}
 
     # ------------------------------------------------------------ 品种
     def set_underlying(self, code):
@@ -163,6 +193,21 @@ class Workbench:
         chain.update(self._szse_market_rows(day, "159915"))
         return chain
 
+    def _risk_sid_index(self, day) -> dict:
+        """当日 risk 表的 security_id → 行 索引（快照兜底查表用，按日缓存）。
+        逐行走 DataFrame 布尔扫描是 O(n²)：674 快照行 × 614 risk 行实测 175ms/次，
+        而 _full_chain 每次挂单/推进/逐日重估都要跑一遍。索引化后 ~4ms。"""
+        hit = self._idx_cache.get(day)
+        if hit is not None:
+            return hit
+        g = self.feed.risk_by_day.get(day)
+        ix = {}
+        if g is not None and len(g):
+            for r in g.itertuples(index=False):
+                ix.setdefault(str(r.security_id), r)
+        self._idx_cache[day] = ix
+        return ix
+
     def _sse_snapshot_fallback(self, day, chain: dict) -> dict:
         """沪市当日快照兜底：逐合约日线未发布的交易日（新浪滞后 1~2 日），
         用 OI 快照库里的当日实时价补齐行情——持仓盯市不再卡在 2 天前。
@@ -170,17 +215,21 @@ class Workbench:
         snap = self._oi.get(day)
         if snap is None:
             return {}
+        sid_ix = self._risk_sid_index(day)
+        if not sid_ix:
+            # 当日无 risk 表 → 无从把 security_id 映射成合约。
+            # 此前这种情况每行都抛 TypeError 再被 except 静默吞掉（674 次异常/调用）
+            return {}
+        prev_day = self.days[max(self.days.index(day) - 1, 0)] if day in self.days else None
         rows = {}
-        risk_day = self.feed.risk_by_day.get(day)
         for r in snap.reset_index().itertuples(index=False):
             # security_id → 合约（risk 表当日映射；OI 快照无 contract_id 列）
+            g = sid_ix.get(str(getattr(r, "security_id", "")))
+            if g is None:
+                continue
             try:
-                g = risk_day[risk_day["security_id"] == getattr(r, "security_id", None)]
-                if g.empty:
-                    continue
-                g = g.iloc[0]
-                inst = self.feed.spec.option(g["underlying"], Right[g["right"]],
-                                             g["expiry"], float(g["strike"]))
+                inst = self.feed.spec.option(g.underlying, Right[g.right],
+                                             g.expiry, float(g.strike))
             except Exception:
                 continue
             if inst.symbol in chain:
@@ -189,15 +238,13 @@ class Workbench:
             vol = float(getattr(r, "volume", 0.0) or 0.0)
             if last != last or last <= 0:
                 continue
-            spot_now = self.close_all.get((inst.underlying, day), float("nan"))
             rows[inst.symbol] = MarketRow(
                 instrument=inst, trade_date=day, close=last, volume=vol,
                 pre_close=float(getattr(r, "pre_close", last) or last),
                 pre_settle=float(getattr(r, "pre_close", last) or last),
-                spot_close=spot_now,
-                spot_prev_close=self.close_all.get(
-                    (inst.underlying, self.days[max(self.days.index(day) - 1, 0)])
-                    if day in self.days else float("nan")))
+                spot_close=self.close_all.get((inst.underlying, day), float("nan")),
+                spot_prev_close=(self.close_all.get((inst.underlying, prev_day), float("nan"))
+                                 if prev_day else float("nan")))
         return rows
 
     def place_order(self, symbol, direction, offset, qty):
@@ -317,7 +364,14 @@ class Workbench:
         cs = dict(self.update_status)
         tail = cs.get("tail") or []
         cs["last"] = tail[-1] if tail else None
+        cs["thread_errors"] = dict(self.thread_errors)
         return cs
+
+    def _note_thread_error(self, where: str, exc) -> None:
+        """后台线程的致命错误必须留痕（计数 + 最近一条），不再被裸 try 静默吞掉。
+        教训：live 线程体的 NameError 被吞，实时行情"从未工作过"而 API 一直返回 ok。"""
+        self.thread_errors[where] = self.thread_errors.get(where, 0) + 1
+        self.thread_errors["last"] = f"{where}: {type(exc).__name__} {str(exc)[:120]}"
 
     # ------------------------------------------------------------ 自动更新调度（晚间盯发布）
     AUTO_WINDOW_START = (19, 0)    # 收盘后开始盯发布（风险指标实测 19:30~21:00+ 才出，15:30 必空）
@@ -388,17 +442,21 @@ class Workbench:
         while True:
             try:
                 self._auto_update_step(dt.now())
-            except Exception:
-                pass
+            except Exception as e:
+                self._note_thread_error("auto_update", e)
             time.sleep(60)
 
     # ------------------------------------------------------------ 实时行情（盘中轮询 sina 快照）
     def _spot_timeout(self, p, u, timeout=5.0):
-        """underlying_spot 带超时保护：东财全量快照偶发网络挂起会卡死整轮轮询（线程存活但缓存空）"""
+        """标的实时价 + 超时看门狗：网络挂起会卡死整轮轮询（线程存活但缓存空）。
+        优先新浪单请求（~100ms），拿不到再退东财全量快照（分页抓取，实测 ~16s）。"""
         box = {}
         def _f():
             try:
-                box["v"] = float(p.underlying_spot(u)["last"])
+                v = float(p.underlying_spot_sina(u).get("last", float("nan")))
+                if v != v:
+                    v = float(p.underlying_spot(u)["last"])
+                box["v"] = v
             except Exception:
                 pass
         t = threading.Thread(target=_f, daemon=True)
@@ -407,7 +465,8 @@ class Workbench:
         return box.get("v", float("nan"))
 
     def live_start(self, underlying: str, expiry: str = None) -> dict:
-        """开启实时轮询：仅采集当前查看的到期月链（ATM±6 档），一轮约 40~90s（逐合约 sina 限流）。
+        """开启实时轮询：采集当前查看的到期月链（ATM±6 档，约 26 合约）。
+        批量快照后一轮亚秒级（原逐合约 sina 限流需 40~90s），加 4s 间隔≈设计目标 5s/轮。
         盘中语义：价格=新浪实时快照（当日），IV/Greeks=最近收盘日官方口径（cursor 日）。
         ATM 档按标的实时价定位（cursor 日无该品种风险表时退化为全量前 13 档）。"""
         if underlying not in UNDERLYINGS:
@@ -442,22 +501,33 @@ class Workbench:
                         strikes = sorted(g["strike"].unique(),
                                          key=lambda k: abs(k - spot))[:13]
                         g = g[g["strike"].isin(strikes)]
-                    for r in (g.itertuples(index=False) if g is not None else []):
-                        try:
-                            s_ = p.contract_spot(r.security_id)
-                            self.live_cache[r.contract_id] = {
-                                "last": s_["last"], "volume": s_["volume"],
-                                "bid": s_["bid"], "ask": s_["ask"],
-                                "open_interest": s_["open_interest"],
-                                "ts": _t.time()}
-                        except Exception:
-                            pass
-                except Exception:
-                    pass
+                    rows_ = list(g.itertuples(index=False)) if g is not None else []
+                    sids = [str(r.security_id) for r in rows_]
+                    cids = [str(r.contract_id) for r in rows_]
+                    t0 = _t.time()
+                    quotes = p.contract_spot_batch(sids) if sids else {}
+                    got = 0
+                    for sid, cid in zip(sids, cids):
+                        if not self.live_target:
+                            break          # live_stop 立即生效（不必等整轮跑完）
+                        q = quotes.get(sid)
+                        if not q:
+                            continue
+                        self.live_cache[cid] = {
+                            "last": q["last"], "volume": q["volume"],
+                            "bid": q["bid"], "ask": q["ask"],
+                            "open_interest": q["open_interest"], "ts": _t.time()}
+                        got += 1
+                    self.live_stats = {
+                        "rounds": self.live_stats["rounds"] + 1, "sids": len(sids),
+                        "quotes": got, "seconds": round(_t.time() - t0, 2),
+                        "last_ok": _t.strftime("%H:%M:%S")}
+                except Exception as e:
+                    self._note_thread_error("live", e)
                 _t.sleep(4)
         self.live_thread = threading.Thread(target=run, daemon=True)
         self.live_thread.start()
-        return {"ok": True, "msg": "实时行情已开启（sina 快照，约 1~2 分钟级刷新）"}
+        return {"ok": True, "msg": "实时行情已开启（sina 批量快照，约 5s/轮）"}
 
     def live_stop(self) -> dict:
         self.live_target = None
@@ -487,7 +557,10 @@ class Workbench:
             self._reprice_positions()
             return {"ok": False, "msg": "已到数据尽头（当前为最新交易日）。可在此日挂单后再次点击「推进」按当日收盘价撮合；持仓已按最新收盘重估"}
         self.cursor = self.days[i + 1]
-        report = self.paper.daily_update(self.cursor)
+        # chain_fn=_full_chain：推进日的逐合约日线若尚未发布（新浪滞后 1~2 个交易日），
+        # 用当日 OI 快照兜底——否则挂单被判"当日无该合约行情"直接 EXPIRED，
+        # 持仓也停在前一日不盯市。与"数据尽头当日撮合"分支口径一致（官方日线优先）。
+        report = self.paper.daily_update(self.cursor, chain_fn=self._full_chain)
         return {"ok": True, "day": str(self.cursor), "equity": report.equity,
                 "fills": report.fills, "notes": report.notes, "signals": len(report.signals)}
 
@@ -538,15 +611,9 @@ class Workbench:
         return cs
 
     def reload_data(self):
-        """采集完成后重建行情索引（无需重启服务器）"""
-        store = ParquetStore(self.data_dir / "store")
-        risk_all = store.read("risk_indicators")
-        daily = pd_read(self.data_dir / "store" / "contract_daily" / "all.parquet")
-        udl = pd_read(self.data_dir / "store" / "underlying_daily" / "all.parquet")
-        udl = udl[udl["underlying"] == DEFAULT_UND]
-        close = pd.Series(udl["close"].astype(float).values, index=udl["date"].values)
-        self.feed = BacktestRunner(risk_all, daily, close)
-        self.days = self.feed._days
+        """采集完成后重建行情面（无需重启服务器）——与 __init__ 同一条装配路径，
+        保证热更新后的撮合/盯市口径与冷启动完全一致（见 _load_market 文档）。"""
+        self._load_market()
         self.paper.feed = self.feed
         if self.cursor not in self.days:
             self.cursor = self.days[-1]
@@ -570,11 +637,24 @@ class Workbench:
     SZSE_MIN_DAYS = 1    # 深市快照门槛：链路验证完备（前结算/OI 均真实数据），日更积累中
                          # 成交基准=前结算价、成交量闸门=OI 代理（2%），如需更严可调高
 
+    def _szse_frames(self) -> list:
+        """深市快照分片（新→旧），按文件 mtime/size 缓存。
+        _full_chain / state / place_order 每次调用都要读这些 parquet，
+        采集写入新分片后签名变化自动失效（不会出现"采了但读不到"）。"""
+        files = sorted((self.data_dir / "store" / "snapshots_szse").glob("*.parquet"),
+                       reverse=True)
+        sig = tuple((str(f), f.stat().st_mtime_ns, f.stat().st_size) for f in files)
+        hit = self._szse_cache.get("frames")
+        if hit is not None and hit[0] == sig:
+            return hit[1]
+        frames = [pd_read(f) for f in files]
+        self._szse_cache["frames"] = (sig, frames)
+        return frames
+
     def szse_days(self) -> int:
         """深市快照已积累的交易日数"""
         n = set()
-        for f in (self.data_dir / "store" / "snapshots_szse").glob("*.parquet"):
-            df = pd_read(f)
+        for df in self._szse_frames():
             n.update(df["trade_date"].astype(str).unique())
         return len(n)
 
@@ -604,9 +684,7 @@ class Workbench:
 
     def _szse_latest(self, underlying: str):
         """深市最新静态快照（含前结算价/OI/涨跌停/合约调整）"""
-        for f in sorted((self.data_dir / "store" / "snapshots_szse").glob("*.parquet"),
-                        reverse=True):
-            df = pd_read(f)
+        for df in self._szse_frames():
             g = df[df["underlying"] == underlying]
             if len(g):
                 return g, str(g["trade_date"].iloc[0])
@@ -678,17 +756,19 @@ class Workbench:
         day_risk = self.feed.risk_by_day[day]
         g = day_risk[day_risk["underlying"] == und]
         spot = self.close_all.get((und, day), float("nan"))
-        gmap = self.feed._greeks_map(day_risk, spot=spot if spot == spot else 1.0, day=day)
+        # 标的收盘缺失时不再用 spot=1.0 兜底算 Greeks：那会展示一串量级完全错误的
+        # Delta/Gamma（1.0 元 vs 真实 1.7~7.8 元），比留空更危险。缺失只可能来自
+        # underlying_daily 当日未采到——界面显示 None，采到后自动恢复。
+        gmap = self.feed._greeks_map(day_risk, spot=spot, day=day) if spot == spot else {}
         rows = []
         for r in g.itertuples(index=False):
             q = self._quote(day, r.contract_id, r.security_id, und)
             mp = None
-            if q:
+            if q and spot == spot:
                 inst = self.feed.spec.option(r.underlying, Right[r.right], r.expiry,
                                              float(r.strike))
-                sc = spot if spot == spot else q["last"]
                 mrow = MarketRow(instrument=inst, trade_date=day, close=q["last"],
-                                 volume=q["volume"], spot_close=sc, spot_prev_close=sc)
+                                 volume=q["volume"], spot_close=spot, spot_prev_close=spot)
                 mp = round(self.broker._margin_per_lot(inst, mrow), 0)
             live = self.live_cache.get(r.contract_id)
             live_fresh = live and (time.time() - live["ts"]) < 120   # 一轮 40~90s,窗口须覆盖轮时长
@@ -730,6 +810,8 @@ class Workbench:
             "ok": True, "cursor": str(day), "underlying": und,
             "live": live_on,
             "live_today": live_today,
+            "live_stats": dict(self.live_stats),
+            "thread_errors": dict(self.thread_errors),
             "now_clock": now.strftime("%Y-%m-%d %H:%M"),
             "server_started": self.server_started,
             "underlying_name": UND_NAME.get(und, und),

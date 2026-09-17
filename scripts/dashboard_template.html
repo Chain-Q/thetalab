@@ -266,7 +266,7 @@ th[data-tip]{ border-bottom:1px dashed var(--text-faint); }
       <select id="daySel" title="模拟时钟日" onchange="setDay(this.value)"></select>
       <button class="chip primary" id="advanceBtn" onclick="advance()" title="推进到下一交易日撮合；若已是最新交易日则按当日收盘价撮合当日挂单">推进下一交易日</button>
       <button class="chip" onclick="toggleTheme()" title="切换明暗主题">主题</button>
-      <button class="chip" id="liveBtn" onclick="toggleLive()" title="盘中只读浏览（sina 快照轮询 ATM±6 档，约 1~2 分钟级刷新；仅沪市品种）">实时行情</button>
+      <button class="chip" id="liveBtn" onclick="toggleLive()" title="盘中只读浏览（sina 批量快照，ATM±6 档约 5 秒一轮；仅沪市品种）">实时行情</button>
       <button class="chip" id="updBtn" onclick="startUpdate()" title="采集当日行情并刷新（约 4~6 分钟）">更新数据</button>
       <button class="chip" onclick="cmdOpen()">搜索 <kbd>Ctrl+K</kbd></button>
     </span>
@@ -568,9 +568,15 @@ function renderTrading(S){
   const spTxt = S.spot!=null ? Number(S.spot).toFixed(3) : "—（未采集标的行情）";
   document.getElementById("chainSpot").textContent =
     `${S.underlying||D.underlying} ${S.underlying_name||""} 收盘 ${spTxt}`;
-  const clockTxt = S.live_today
+  let clockTxt = S.live_today
     ? `盘中实时 ${S.now_clock||""}（价格=实时快照）｜ 数据基准 ${S.cursor}（IV/Greeks/撮合为该收盘日官方口径）`
     : `模拟时钟 ${S.cursor} ｜ ${S.underlying||D.underlying} ${S.underlying_name||""}`;
+  // 实时轮询的产出侧指标：条数/耗时直接摆出来——"线程活着"不等于"线程在工作"
+  const ls = S.live_stats || {};
+  if (S.live && ls.quotes) clockTxt += ` ｜ 实时 ${ls.quotes}/${ls.sids} 合约·${ls.seconds}s 一轮 @${ls.last_ok||""}`;
+  const te = S.thread_errors || {};
+  if ((te.auto_update||0) + (te.live||0) > 0)
+    clockTxt += ` ｜ ⚠ 后台线程异常 ${(te.auto_update||0)+(te.live||0)} 次（${te.last||""}）`;
   document.getElementById("meta").textContent = clockTxt;
   const daySel = document.getElementById("daySel");
   if(S.days && S.days.length){
@@ -1019,7 +1025,7 @@ document.addEventListener("keydown",e=>{
 
 /* ================= 启动 ================= */
 document.getElementById("liveNote").innerHTML = LIVE
-  ? "🟢 服务器模式：下单/确认/推进交易日可用，状态每 5s 刷新。交易日收盘后 19:00~23:00 服务器自动盯交易所发布并采集（发布约 19:30~21:00，无需手动）；盘中可点「实时行情」——价格为新浪实时快照（当日），IV/Greeks 仍为最近收盘日官方口径，撮合永远按 T+1 收盘价。"
+  ? "🟢 服务器模式：下单/确认/推进交易日可用，状态每 5s 刷新。交易日收盘后 19:00~23:00 服务器自动盯交易所发布并采集（发布约 19:30~21:00，无需手动）；盘中可点「实时行情」——新浪批量快照约 5 秒一轮（时钟条显示实际条数/耗时），价格为当日实时价，IV/Greeks 仍为最近收盘日官方口径，撮合永远按 T+1 收盘价。"
   : "🟡 静态预览：可浏览行情与研究，但<b>无法下单</b>。启用交易：命令行运行 <code>python -m thetalab.server</code> 后打开 http://127.0.0.1:8300";
 if(LIVE){ refresh(); setInterval(refresh, 5000); }
 else { renderTrading(pseudoState()); }

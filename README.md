@@ -43,7 +43,7 @@
   ↓    ↓ 发布（实测 19:30~21:00+）↓
        collect_daily（风险指标 / 标的日线 / 深市快照 / OI / ATM IV）
   ↓    热更新 → 模拟时钟自动跳最新交易日（有未撮合挂单则不跳并提示先推进）
-盘中    可选实时行情：新浪快照轮询，页面双时间基准
+盘中    可选实时行情：新浪批量快照约 5s/轮（时钟条显示实际条数/耗时），页面双时间基准
         「盘中实时 HH:MM（价格=实时快照）｜ 数据基准 08-31（IV/Greeks/撮合）」
 ```
 
@@ -90,7 +90,7 @@ Windows 亦可双击「启动工作台.bat」/「每日更新.bat」；或直接
 ## 运行测试
 
 ```bash
-# 9 套共 83 项：定价内核 / 撮合 / 组合 / 回测器 / 策略 DSL / 信号 / 模拟盘 / API / 集成
+# 11 套共 97 项：定价内核 / 撮合 / 组合 / 回测器 / 策略 DSL / 信号 / 模拟盘 / API / 集成 / 数据源解析 / 采集落库
 python -m thetalab.tests.test_core
 python -m thetalab.tests.test_integration
 # …其余各套位于 thetalab/tests/，逐模块直跑
@@ -112,7 +112,7 @@ thetalab/
 ├── strategy/   spec(DSL) · templates(12个) · advisor(打分) · signals
 ├── scripts/    collect_daily · collect_contract_history · build_dashboard · sensitivity_analysis
 ├── server.py   标准库 ThreadingHTTPServer（API + 晚间调度 + 实时行情，零 Web 框架）
-├── tests/      9 套 83 项测试
+├── tests/      11 套 97 项测试
 └── docs/img    README 截图
 ```
 
@@ -130,6 +130,9 @@ thetalab/
 - 到期行权按现金结算简化（实物交割的份额交收/T+1 未建模）
 - 模拟收益系统性偏高（无盘口深度、未建模保证金临时上调）；仅作策略间相对比较
 - 上交所风险指标约 19:30~21:00 发布，当日页面需等待晚间调度采集完成
+- 新浪逐合约日线发布滞后实测可达 4 个交易日：晚间调度按日级覆盖对账自动补缺口（每合约一次请求 + 失败退避重试）；
+  未落库的当日由 OI 快照兜底盯市（价格=快照价，非交易所结算价），官方日线到库后自动优先
+- 实时行情仅覆盖沪市品种（新浪期权快照无深市），159915 盘中只有快照口径
 
 ## 免责声明
 

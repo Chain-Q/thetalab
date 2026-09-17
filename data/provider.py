@@ -29,6 +29,62 @@ from ..core.spec import expiry_of_month
 __all__ = ["MarketDataProvider", "SseOptionProvider", "ParquetStore"]
 
 
+# sina 期权快照字段序——与 akshare option_sse_spot_price_sina 的 field_list 逐位一致
+# （实测响应 51 字段，akshare 只映射前 43 位；批量解析沿用同一映射，两条路径同口径）
+_SINA_OPT_FIELDS = [
+    "买量", "买价", "最新价", "卖价", "卖量", "持仓量", "涨幅", "行权价",
+    "昨收价", "开盘价", "涨停价", "跌停价",
+    "申卖价五", "申卖量五", "申卖价四", "申卖量四", "申卖价三", "申卖量三",
+    "申卖价二", "申卖量二", "申卖价一", "申卖量一",
+    "申买价一", "申买量一", "申买价二", "申买量二", "申买价三", "申买量三",
+    "申买价四", "申买量四", "申买价五", "申买量五",
+    "行情时间", "主力合约标识", "状态码", "标的证券类型", "标的股票",
+    "期权合约简称", "振幅", "最高价", "最低价", "成交量", "成交额",
+]
+
+
+_SINA_HEADERS = {
+    "Accept": "*/*",
+    "Referer": "https://stock.finance.sina.com.cn/",
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                  "(KHTML, like Gecko) Chrome/97.0.4692.71 Safari/537.36",
+}
+
+
+def _sina_get(symbols: List[str], timeout: float = 10.0) -> str:
+    """hq.sinajs.cn 一次取多个符号（期权 CON_OP_<security_id>；标的 sh510300/sz159915）。
+    GBK 响应；未知/已摘牌符号返回空串，由调用方跳过。"""
+    import urllib.request
+    url = "https://hq.sinajs.cn/list=" + ",".join(symbols)
+    req = urllib.request.Request(url, headers=_SINA_HEADERS)
+    return urllib.request.urlopen(req, timeout=timeout).read().decode("gbk", "ignore")
+
+
+def _sina_option_dict(kv: Dict, security_id: Optional[str] = None) -> Dict:
+    """字段名→值 映射为快照 dict。逐合约(akshare)与批量(直连 hq.sinajs.cn)共用此函数，
+    避免两条路径口径漂移（单位已实证：成交量/持仓量=张）。"""
+    def num(k):
+        v = kv.get(k, "nan")
+        try:
+            return float(v if v not in (None, "") else "nan")
+        except (TypeError, ValueError):
+            return float("nan")
+    out = {
+        "short_name": kv.get("期权合约简称"),
+        "underlying": kv.get("标的股票"),
+        "last": num("最新价"), "bid": num("买价"), "ask": num("卖价"),
+        "bid_vol": num("买量"), "ask_vol": num("卖量"),
+        "open": num("开盘价"), "high": num("最高价"), "low": num("最低价"),
+        "pre_close": num("昨收价"),
+        "limit_up": num("涨停价"), "limit_down": num("跌停价"),
+        "volume": num("成交量"), "open_interest": num("持仓量"),
+        "quote_time": kv.get("行情时间"),
+    }
+    if security_id is not None:
+        out = {"security_id": str(security_id), **out}
+    return out
+
+
 class MarketDataProvider(ABC):
     """数据源协议——业务层只认这个接口，不认 akshare"""
 
@@ -79,6 +135,7 @@ class SseOptionProvider(MarketDataProvider):
         self._daily_cache: Dict[str, pd.DataFrame] = {}
         self._last_call: float = 0.0
         self.min_interval = min_interval   # 简单限速，避免触发上游频控
+        self._etf_fast_cache: Dict[str, list] = {}   # symbol -> [dict, ts]（实例级，避免跨线程共享）
 
     def _throttle(self):
         wait = self.min_interval - (time.time() - self._last_call)
@@ -170,22 +227,73 @@ class SseOptionProvider(MarketDataProvider):
         import akshare as ak
         self._throttle()
         raw = ak.option_sse_spot_price_sina(symbol=str(security_id))
-        kv = dict(zip(raw["字段"].astype(str), raw["值"]))
-        num = lambda k: float(kv.get(k, "nan") or "nan")
-        return {
-            "security_id": str(security_id),
-            "short_name": kv.get("期权合约简称"),
-            "underlying": kv.get("标的股票"),
-            "last": num("最新价"), "bid": num("买价"), "ask": num("卖价"),
-            "bid_vol": num("买量"), "ask_vol": num("卖量"),
-            "open": num("开盘价"), "high": num("最高价"), "low": num("最低价"),
-            "pre_close": num("昨收价"),
-            "limit_up": num("涨停价"), "limit_down": num("跌停价"),
-            "volume": num("成交量"), "open_interest": num("持仓量"),
-            "quote_time": kv.get("行情时间"),
-        }
+        return _sina_option_dict(dict(zip(raw["字段"].astype(str), raw["值"])),
+                                 str(security_id))
 
-    # ---- 标的 ETF 实时快照（盘中定位 ATM 档用）
+    # ---- 批量合约快照（一次请求多合约；实测 13 合约 0.10s vs 逐合约 2.94s ≈ 29x）
+    SINA_BATCH_CHUNK = 60
+
+    def contract_spot_batch(self, security_ids, chunk: Optional[int] = None,
+                            timeout: float = 10.0) -> Dict[str, Dict]:
+        """{security_id: 快照 dict}，结构与 contract_spot() 完全一致。
+
+        实时行情轮询此前逐合约请求（0.18s 限流 + 单次往返），ATM±6 档一轮 40~90s，
+        远慢于设计的 5s/轮。sina 的 hq.sinajs.cn 支持 list=CON_OP_a,CON_OP_b,…，
+        一轮压到亚秒级。单批请求失败只丢该批（不抛），无效/已摘牌合约返回空串→跳过；
+        产出侧指标（拿到几条/耗时）由调用方统计，避免"线程活着但没产出"的静默死寂。
+        """
+        sids = [str(s).strip() for s in security_ids if str(s).strip()]
+        out: Dict[str, Dict] = {}
+        step = chunk or self.SINA_BATCH_CHUNK
+        for i in range(0, len(sids), step):
+            part = sids[i:i + step]
+            self._throttle()
+            try:
+                body = _sina_get(["CON_OP_" + s for s in part], timeout=timeout)
+            except Exception:
+                continue
+            for line in body.splitlines():
+                line = line.strip()
+                if not line.startswith("var hq_str_CON_OP_"):
+                    continue
+                key, _, val = line.partition("=")
+                sid = key[len("var hq_str_CON_OP_"):].strip()
+                val = val.strip()
+                if val.endswith(";"):
+                    val = val[:-1].strip()
+                val = val.strip('"')
+                if not val:
+                    continue
+                out[sid] = _sina_option_dict(
+                    dict(zip(_SINA_OPT_FIELDS, val.split(","))), sid)
+        return out
+
+    # ---- 标的 ETF 实时快照（sina 单请求，实测 ~100ms，沪深两市均覆盖）
+    def underlying_spot_sina(self, underlying: str, timeout: float = 8.0) -> Dict:
+        """标的 ETF 最新价。盘中定位 ATM 档此前走东财 fund_etf_spot_em（全市场分页抓取，
+        实测 ~16s/次，60s TTL 一到就卡住整轮轮询）——期权快照批量化后它是唯一瓶颈。
+        字段序实测：0名称 1今开 2昨收 3最新 4最高 5最低 8成交量(股) 9成交额 30日期 31时间。"""
+        sym = ("sz" if str(underlying).startswith("1") else "sh") + str(underlying)
+        hit = self._etf_fast_cache.get(sym)
+        if hit is not None and time.time() - hit[1] < 3.0:
+            return hit[0]
+        self._throttle()
+        out: Dict = {"last": float("nan")}
+        try:
+            val = _sina_get([sym], timeout=timeout).strip()
+            val = val.partition("=")[2].strip().rstrip(";").strip(chr(34))
+            f = val.split(",")
+            if len(f) > 31:
+                out = {"last": float(f[3]), "open": float(f[1]), "pre_close": float(f[2]),
+                       "high": float(f[4]), "low": float(f[5]), "volume": float(f[8]),
+                       "amount": float(f[9]), "name": f[0],
+                       "quote_time": f"{f[30]} {f[31]}"}
+        except Exception:
+            pass
+        self._etf_fast_cache[sym] = [out, time.time()]
+        return out
+
+    # ---- 标的 ETF 实时快照（东财全量兜底，sina 失败时才走）
     _etf_spot_cache = None   # [df, ts]——全量快照一次请求，60s 内复用
     def underlying_spot(self, underlying: str) -> Dict:
         """标的 ETF 最新价。东财全量 ETF 快照一次请求本地过滤（避免逐品种请求）"""

@@ -5,13 +5,16 @@ thetalab.scripts.collect_daily — 每日收盘后统一采集入口（设计文
     1. 当日 risk_indicators（IV/Greeks，全市场一次调用）
     2. 标的日线增量（510300）
     3. 逐合约 OI/量 快照（自建历史 OI 库的唯一来源——sina/交易所均无历史逐合约 OI）
-    4. 重算 ATM IV 序列（追加）
-    5. 重建 dashboard.html
+    4. 沪市逐合约日线日级补缺（新浪发布滞后；缺日会让撮合链为空 → 下单被拒/持仓不盯市）
+    5. 逐合约 OI 快照落库后重算 ATM IV 序列
+页面重建不在本脚本内：「每日更新.bat」第 2 步另行调用 build_dashboard.py。
 运行：python -m thetalab.scripts.collect_daily [date=今天]
 """
 import sys
+import threading as _th
 import time
 import warnings
+import socket
 from datetime import date
 from pathlib import Path
 
@@ -43,13 +46,63 @@ _ensure_thetalab_importable()
 import pandas as pd
 
 from thetalab.data.provider import ParquetStore, SseOptionProvider
+from thetalab.scripts.collect_contract_history import build_contract_id_map
 from thetalab.scripts.collect_risk_history import UNDERLYING
+
+DAILY_WORKERS = 3       # 逐合约请求并发度（5 线程实测 ≈14 请求/秒 → sina 拒连）
+DAILY_INTERVAL = 0.5
+DAY_BUDGET = 420.0
+SOCKET_TIMEOUT = 20.0
+RETRY_ROUNDS = 3      # 上游空响应/拒连时的重试轮数
+RETRY_SLEEP = 75.0    # 轮间退避（秒）：sina 限流通常一两分钟解除    # 每线程限流：3 线程 ≈ 6 请求/秒
 
 
 def self_recent_days(day: date, n: int):
     """含 day 在内的往前 n 个自然日（日级覆盖检查用）"""
     from datetime import timedelta
     return [day - timedelta(days=i) for i in range(n)]
+
+
+def _thread_provider(min_interval: float = 0.3) -> SseOptionProvider:
+    """当前线程专属 provider（各线程独立限流）。
+    共享实例的 _throttle 靠 self._last_call，跨线程竞态会让限流失效；
+    而"每次调用新建实例"同样等于不限流（_last_call 恒 0）——两者都不对。"""
+    import threading
+    tls = getattr(_thread_provider, "_tls", None)
+    if tls is None:
+        tls = _thread_provider._tls = threading.local()
+    p = getattr(tls, "p", None)
+    if p is None or p.min_interval != min_interval:
+        p = SseOptionProvider(min_interval=min_interval)
+        tls.p = p
+    return p
+
+
+def build_daily_row(hist, tgt: str, sid: str, und: str, m_day, m_glob):
+    """从某合约的全历史里取出缺口日 tgt 那一行并补齐落库列（返回 None=该日无数据）。
+
+    索引必须显式对齐：pd.Series([...]) 默认 RangeIndex(0..n-1)，而缺口日切片保留
+    原历史索引（常为 100+），随后 day["contract_id"] = <Series> 按标签对齐会把整列
+    写成 NaN；NaN 之间在 drop_duplicates(["trade_date","contract_id"]) 里视为相等，
+    于是整天 600+ 行折叠成 1 行且不报任何错。2026-09-11 定位：9-07~9-10 补缺全丢，
+    表现为「当日无该合约行情」下单被拒、持仓推进后不盯市（此前误判为新浪发布滞后）。
+    """
+    if hist is None or hist.empty:
+        return None
+    day = hist[hist["date"].astype(str).str[:10] == tgt]
+    if day.empty:
+        return None                          # 上游尚未发布该日
+    day = day.copy()
+    day["security_id"] = str(sid)
+    day["underlying"] = str(und)
+    day["trade_date"] = day["date"]
+    key = list(zip(day["trade_date"], day["security_id"]))
+    cid = pd.Series([m_day.get(k) for k in key], index=day.index)
+    cid = cid.fillna(day["security_id"].map(m_glob))
+    day["contract_id"] = cid.fillna(day["security_id"])
+    if day["contract_id"].isna().any():
+        return None                          # 宁可缺该行，也不写 NaN 主键（会被折叠）
+    return day
 
 
 def main(day: date = None):
@@ -123,104 +176,150 @@ def main(day: date = None):
     except Exception as e:
         log.append(f"深市快照 FAIL: {type(e).__name__} {str(e)[:60]}")
 
-    # 2c) 沪市逐合约日线日级补缺：新浪日线发布滞后（实测 8-31 采于 20:57 全部只有 8-28），
-    # 而 collect_contract_history 按 security_id 断点、采过即跳过，缺口会永久留存 →
-    # 撮合链缺当日沪市合约，下单报"当日无该合约行情"。
-    # 交易日基准 = risk ∪ underlying_daily（服务器停机的夜晚 risk 也可能整日缺失，
-    # 但 sina 标的日线发布及时，可当交易日历）；缺日先补 risk 再补逐合约日线。
+    # 2c) 沪市逐合约日线日级补缺：新浪逐合约日线的发布滞后实测可达 4 个交易日，
+    # 而 collect_contract_history 按 security_id 断点、采过即永久跳过 -> 缺口会永久
+    # 留存，表现为「当日无该合约行情」下单被拒、持仓推进后不盯市。
+    # 交易日基准 = risk 并 underlying_daily（服务器停机的夜晚 risk 整日缺失也不漏）；
+    # 缺日先补 risk 再补逐合约日线。**每个合约只请求一次全历史**，一次切出所有缺口日
+    # ——逐日各拉一遍会把同一合约重复请求 N 次，实测触发 sina 限流封禁。
     try:
+        socket.setdefaulttimeout(SOCKET_TIMEOUT)   # akshare 的 requests 不带 timeout
         daily_all = pd.read_parquet(store.root / "contract_daily" / "all.parquet")
         daily_all["_d"] = daily_all["trade_date"].astype(str).str[:10]
-        cnt_by_day = daily_all[daily_all["_d"] <= str(day)].groupby("_d").size().to_dict()
+        cnt = daily_all.groupby("_d").size().to_dict()
         risk_df = store.read("risk_indicators")
         risk_days = set(risk_df["trade_date"].astype(str).str[:10].unique())
         udl_days = set(pd.read_parquet(store.root / "underlying_daily" / "all.parquet")
                        ["date"].astype(str).str[:10].unique())
-        risk_cnt = risk_df[risk_df["underlying"] != "159915"].groupby(
-            risk_df["trade_date"].astype(str).str[:10]).size().to_dict()
-        expect_default = max(risk_cnt.values()) if risk_cnt else 600
-        missing_days = []
-        for d in sorted(risk_days | udl_days)[-5:]:
-            if d > str(day):
-                continue
-            if cnt_by_day.get(d, 0) < 0.8 * risk_cnt.get(d, expect_default):
-                missing_days.append(d)
-        missing_days = missing_days[:2]   # 单次最多补 2 天（每天约 600 合约请求）
-        if missing_days:
-            log.append(f"沪市逐合约日线缺日: {missing_days}，增量补拉（仅缺失合约）")
-            # 用显式 spec 加载绕过"thetalab 默认查找失效"的环境问题（与头部兜底同理）
-            import importlib.util as _iu
-            def _load_cch():
-                _parent = str(Path(__file__).resolve().parents[2])
-                _f = Path(_parent) / "thetalab" / "scripts" / "collect_contract_history.py"
-                _spec = _iu.spec_from_file_location(
-                    "thetalab.scripts.collect_contract_history", _f)
-                _m = _iu.module_from_spec(_spec)
-                sys.modules[_spec.name] = _m
-                _spec.loader.exec_module(_m)
-                return _m.build_contract_id_map
-            try:
-                from thetalab.scripts.collect_contract_history import build_contract_id_map
-            except Exception:   # 默认查找失败 → 显式加载
-                build_contract_id_map = _load_cch()
-            for tgt in missing_days:
-                # risk 也缺该日 → 先补 risk（交易所历史文件可回拉），否则用其合约清单
-                if tgt not in risk_days:
-                    try:
-                        rd = p.risk_indicators(date.fromisoformat(tgt))
-                        if not rd.empty:
-                            store.write("risk_indicators", rd)
-                            risk_df = pd.concat([risk_df, rd], ignore_index=True)
-                            log.append(f"  补 {tgt} 风险指标: +{len(rd)} 行")
-                    except Exception as e:
-                        log.append(f"  补 {tgt} 风险指标 FAIL: {type(e).__name__}")
-                risk_tgt = risk_df[risk_df["trade_date"].astype(str).str[:10] == tgt]
-                if risk_tgt.empty:   # risk 拉不到：用最近一天的合约清单兜底
-                    last_d = max(risk_days)
-                    risk_tgt = risk_df[risk_df["trade_date"].astype(str).str[:10] == last_d]
-                m_day, m_glob = build_contract_id_map(risk_df)
-                have_tgt = set(daily_all[daily_all["_d"] == tgt]["security_id"].unique())
-                todo = [(s, u) for s, u in
-                        risk_tgt[risk_tgt["underlying"] != "159915"]
-                        .drop_duplicates("security_id")[["security_id", "underlying"]]
-                        .itertuples(index=False, name=None)
-                        if s not in have_tgt]
-                log.append(f"  目标日 {tgt} 合约 {risk_tgt['security_id'].nunique()} 个，缺失待补 {len(todo)}")
-                ok2 = fail2 = 0
-                new_rows = []
-                for sid, und in todo:
-                    try:
-                        df = p.contract_daily(sid)
-                        if df.empty:
-                            continue
-                        df = df[df["date"].astype(str).str[:10] == tgt]   # 只取缺口日行
-                        if df.empty:
-                            continue
-                        df["security_id"] = sid
-                        df["underlying"] = und
-                        df["trade_date"] = df["date"]
-                        key = list(zip(df["trade_date"], df["security_id"]))
-                        cid = pd.Series([m_day.get(k) for k in key]) \
-                            .fillna(df["security_id"].map(m_glob))
-                        df["contract_id"] = cid.fillna(df["security_id"])
-                        new_rows.append(df)
-                        ok2 += 1
-                    except Exception:
-                        fail2 += 1
-                if new_rows:
-                    inc = pd.concat(new_rows, ignore_index=True)
-                    daily_all = pd.concat([daily_all, inc], ignore_index=True) \
-                        .drop_duplicates(subset=["trade_date", "contract_id"], keep="last")
-                    daily_all.to_parquet(store.root / "contract_daily" / "all.parquet",
-                                         index=False)
-                    log.append(f"  逐合约日线补缺 {tgt}: +{len(inc)} 行（{ok2} 合约 / fail {fail2}）")
-                else:
-                    log.append(f"  逐合约日线补缺 {tgt}: 数据源仍无（发布滞后），下轮重试")
+        sse = risk_df[risk_df["underlying"] != "159915"]
+        rcnt = sse.groupby(sse["trade_date"].astype(str).str[:10]).size().to_dict()
+        base = max(rcnt.values()) if rcnt else 600
+        missing_days = [d for d in sorted(risk_days | udl_days)[-8:]
+                        if d <= str(day) and cnt.get(d, 0) < 0.8 * rcnt.get(d, base)][:5]
+        if not missing_days:
+            log.append("逐合约日线日级覆盖完整（近 8 交易日）")
         else:
-            log.append("逐合约日线日级覆盖完整（近 5 交易日）")
+            log.append(f"沪市逐合约日线缺日: {missing_days}，按合约一次性补拉")
+            for tgt in missing_days:            # risk 缺日先补（交易所历史可回拉）
+                if tgt in risk_days:
+                    continue
+                try:
+                    rd = p.risk_indicators(date.fromisoformat(tgt))
+                    if not rd.empty:
+                        store.write("risk_indicators", rd)
+                        risk_df = pd.concat([risk_df, rd], ignore_index=True)
+                        log.append(f"  补 {tgt} 风险指标: +{len(rd)} 行")
+                except Exception as e:
+                    log.append(f"  补 {tgt} 风险指标 FAIL: {type(e).__name__}")
+            risk_df = risk_df.copy()
+            risk_df["_d"] = risk_df["trade_date"].astype(str).str[:10]
+            m_day, m_glob = build_contract_id_map(risk_df)
+            have = {t: set(daily_all[daily_all["_d"] == t]["security_id"]
+                           .astype(str).unique()) for t in missing_days}
+            uni, plan = {}, {}
+            for tgt in missing_days:
+                g = risk_df[(risk_df["_d"] == tgt) & (risk_df["underlying"] != "159915")]
+                if g.empty:                      # risk 拉不到：用最近一天的合约清单兜底
+                    g = risk_df[(risk_df["_d"] == max(risk_days)) &
+                                (risk_df["underlying"] != "159915")]
+                uni[tgt] = int(g["security_id"].nunique())
+                for sid, und in g.drop_duplicates("security_id")[
+                        ["security_id", "underlying"]].itertuples(index=False, name=None):
+                    sid = str(sid)
+                    if sid in have[tgt]:
+                        continue
+                    ent = plan.setdefault(sid, {"und": und, "days": []})
+                    if tgt not in ent["days"]:
+                        ent["days"].append(tgt)
+            log.append(f"  待请求合约 {len(plan)} 个（一次请求覆盖 {len(missing_days)} 个缺口日）")
+            from concurrent.futures import ThreadPoolExecutor, as_completed
+            rows = {t: [] for t in missing_days}
+            ok2 = fail2 = empty2 = skip2 = nodata2 = 0
+            abort = _th.Event()
+            t0 = time.time()
+
+            def _fetch(job, _m_day=m_day, _m_glob=m_glob, _ev=abort):
+                """一个合约只请求一次全历史，一次切出它所有缺口日的行。
+
+                被上游限流的表现是"返回空表"或"直接拒连"，与"该日尚未发布"是两件
+                不同的事：前者退避重试就能拿到数据，后者重试纯属浪费——所以分开计数，
+                不再笼统报"源无"（2026-09-12 实测 674 合约全报源无、稍后重跑全到手）。
+                """
+                sid, ent = job
+                hist, last = None, "nodata"
+                for rnd in range(RETRY_ROUNDS):
+                    if _ev.is_set():
+                        return "skip", None
+                    try:
+                        hist = _thread_provider(DAILY_INTERVAL).contract_daily(sid)
+                        last = "nodata"
+                    except Exception:
+                        hist, last = None, "fail"   # 网络异常/被拒连
+                    if hist is not None and not hist.empty:
+                        break
+                    if rnd + 1 < RETRY_ROUNDS:
+                        _ev.wait(RETRY_SLEEP)       # 可被中止打断的退避
+                        _thread_provider(DAILY_INTERVAL)._daily_cache.pop(sid, None)
+                        if _ev.is_set():
+                            return "skip", None
+                if hist is None or hist.empty:
+                    return last, None
+                got = {}
+                for tgt in ent["days"]:
+                    r = build_daily_row(hist, tgt, sid, ent["und"], _m_day, _m_glob)
+                    if r is not None:
+                        got[tgt] = r
+                return ("ok", got) if got else ("pending", None)
+
+            if plan:
+                with ThreadPoolExecutor(max_workers=DAILY_WORKERS) as ex:
+                    futs = [ex.submit(_fetch, a) for a in plan.items()]
+                    done = 0
+                    for fu in as_completed(futs):
+                        tag, got = fu.result()
+                        if tag == "ok":
+                            ok2 += 1
+                            for tgt, r in got.items():
+                                rows[tgt].append(r)
+                        elif tag == "fail":
+                            fail2 += 1
+                        elif tag == "nodata":
+                            nodata2 += 1
+                        elif tag == "skip":
+                            skip2 += 1
+                        else:
+                            empty2 += 1
+                        done += 1
+                        if abort.is_set():
+                            continue
+                        # 熔断：失败过半=上游限流；超预算=网络挂起（旧版曾卡死 1h40min）
+                        if done >= 60 and (fail2 + nodata2) > done * 0.5:
+                            abort.set()
+                            log.append(f"  上游异常过半（失败 {fail2} + 空响应 {nodata2}"
+                                       f"/{done}）-> 疑似限流，中止剩余请求，下轮重试")
+                        elif time.time() - t0 > DAY_BUDGET:
+                            abort.set()
+                            log.append(f"  超出时间预算 {DAY_BUDGET:.0f}s（ok {ok2} / "
+                                       f"fail {fail2}）-> 中止剩余请求，下轮重试")
+            for tgt in missing_days:
+                if not rows[tgt]:
+                    log.append(f"  逐合约日线补缺 {tgt}: 无可用数据（该日未发布 {empty2}"
+                               f" / 上游无数据 {nodata2} / 请求失败 {fail2}"
+                               f" / 已中止 {skip2}）")
+                    continue
+                inc = pd.concat(rows[tgt], ignore_index=True)
+                daily_all = pd.concat([daily_all, inc], ignore_index=True)
+                daily_all = daily_all.drop_duplicates(
+                    subset=["trade_date", "contract_id"], keep="last")
+                daily_all["_d"] = daily_all["trade_date"].astype(str).str[:10]
+                # 落库口径必须可对账：报该日真实覆盖合约数，不是"本次新增行数"
+                log.append(f"  逐合约日线补缺 {tgt}: 新增 {len(inc)} 行，该日覆盖 "
+                           f"{int((daily_all['_d'] == tgt).sum())}/{uni.get(tgt, 0)} 合约")
+                daily_all.to_parquet(store.root / "contract_daily" / "all.parquet",
+                                     index=False)
+            log.append(f"  日线补缺耗时 {time.time() - t0:.0f}s")
     except Exception as e:
         log.append(f"逐合约日线补缺 FAIL: {type(e).__name__} {str(e)[:60]}")
-
     # 3) 逐合约 OI/量 快照（当日全合约，自建 OI 库）
     try:
         try:
@@ -236,13 +335,12 @@ def main(day: date = None):
             rows = []
             def _fetch_one(sid):
                 try:
-                    sp = SseOptionProvider(min_interval=0.35)
-                    s_ = sp.contract_spot(sid)
+                    s_ = _thread_provider(0.35).contract_spot(sid)
                     s_["trade_date"] = day
                     return s_
                 except Exception:
                     return None
-            with ThreadPoolExecutor(max_workers=5) as ex:
+            with ThreadPoolExecutor(max_workers=DAILY_WORKERS) as ex:
                 for fut in as_completed([ex.submit(_fetch_one, s) for s in sids]):
                     r = fut.result()
                     if r is not None:
